@@ -7,6 +7,7 @@ import argparse
 import csv
 import io
 import re
+import time
 from pathlib import Path
 
 import torch
@@ -71,6 +72,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="Qwen model identifier.")
     parser.add_argument("--output-csv", default=DEFAULT_OUTPUT_CSV, help="Output CSV path.")
     parser.add_argument(
+        "--cache-dir",
+        default="./hf_cache",
+        help="Local cache directory for model and dataset downloads.",
+    )
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="Enable HF streaming mode. Default is local cached dataset iteration for speed.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=8,
+        help="Inference batch size. Increase to use more VRAM and improve throughput.",
+    )
+    parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=80,
+        help="Maximum generated tokens per sample.",
+    )
+    parser.add_argument(
+        "--log-every",
+        type=int,
+        default=50,
+        help="Print throughput stats every N processed samples.",
+    )
+    parser.add_argument(
         "--max-samples",
         type=int,
         default=None,
@@ -86,14 +115,32 @@ def load_raw_image(item: dict) -> Image.Image:
     return img_data
 
 
-def load_model_and_processor(model_id: str):
+def load_model_and_processor(model_id: str, cache_dir: str):
     torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_id,
-        torch_dtype=torch_dtype,
-        device_map="auto",
-    )
-    processor = AutoProcessor.from_pretrained(model_id)
+    model_kwargs = {
+        "torch_dtype": torch_dtype,
+        "device_map": "auto",
+        "cache_dir": cache_dir,
+    }
+    if torch.cuda.is_available():
+        model_kwargs["attn_implementation"] = "flash_attention_2"
+
+    try:
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_kwargs)
+    except Exception as exc:
+        if "attn_implementation" in model_kwargs:
+            print(f"flash_attention_2 unavailable ({exc}); falling back to default attention.")
+            model_kwargs.pop("attn_implementation", None)
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_kwargs)
+        else:
+            raise
+
+    processor = AutoProcessor.from_pretrained(model_id, cache_dir=cache_dir)
+
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     return model, processor
 
 
@@ -114,10 +161,75 @@ def build_messages(image: Image.Image) -> list[dict]:
     ]
 
 
+def process_batch(
+    batch_items: list[dict],
+    model,
+    processor,
+    device: str,
+    max_new_tokens: int,
+) -> list[tuple[str, str]]:
+    messages_batch: list[list[dict]] = []
+    ids: list[str] = []
+
+    for item in batch_items:
+        raw_image = load_raw_image(item)
+        img_id = str(item.get("id", "unknown"))
+        ids.append(img_id)
+        messages_batch.append(build_messages(raw_image))
+
+    texts = [
+        processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        for messages in messages_batch
+    ]
+
+    image_inputs: list = []
+    for messages in messages_batch:
+        img_inputs, _ = process_vision_info(messages)
+        image_inputs.extend(img_inputs)
+
+    inputs = processor(
+        text=texts,
+        images=image_inputs,
+        padding=True,
+        return_tensors="pt",
+    ).to(device)
+
+    with torch.inference_mode():
+        if device == "cuda":
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                generated_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                )
+        else:
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
+
+    output_texts = processor.batch_decode(
+        generated_ids,
+        skip_special_tokens=True,
+    )
+
+    results: list[tuple[str, str]] = []
+    for img_id, output_text in zip(ids, output_texts):
+        predicted = extract_prediction(output_text.strip().lower())
+        results.append((img_id, predicted))
+    return results
+
+
 def main() -> None:
     args = parse_args()
-    dataset = load_dataset(args.dataset, streaming=True, split=args.split)
-    model, processor = load_model_and_processor(args.model_id)
+    dataset = load_dataset(
+        args.dataset,
+        split=args.split,
+        streaming=args.streaming,
+        cache_dir=args.cache_dir,
+    )
+    model, processor = load_model_and_processor(args.model_id, args.cache_dir)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     output_path = Path(args.output_csv)
@@ -129,48 +241,74 @@ def main() -> None:
         writer = csv.DictWriter(handle, fieldnames=header)
         writer.writeheader()
 
+        processed = 0
+        failed = 0
+        started_at = time.time()
+        batch: list[dict] = []
+
         for index, item in enumerate(dataset, start=1):
             if args.max_samples is not None and index > args.max_samples:
                 break
 
-            try:
-                raw_image = load_raw_image(item)
-                img_id = item.get("id", f"unknown_{index}")
-                messages = build_messages(raw_image)
-
-                text = processor.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                image_inputs, _ = process_vision_info(messages)
-                inputs = processor(
-                    text=[text],
-                    images=image_inputs,
-                    padding=True,
-                    return_tensors="pt",
-                ).to(device)
-
-                with torch.inference_mode():
-                    generated_ids = model.generate(**inputs, max_new_tokens=100)
-
-                output_text = processor.batch_decode(
-                    generated_ids,
-                    skip_special_tokens=True,
-                )[0].strip().lower()
-                predicted = extract_prediction(output_text)
-
-                row = {category: 0 for category in CATEGORIES}
-                row["id"] = img_id
-                if predicted in CATEGORIES:
-                    row[predicted] = 1
-
-                writer.writerow(row)
-                print(f"Sample {index} | ID: {img_id}")
-                print(f"Final Prediction: {predicted}")
-            except Exception as exc:
-                print(f"Error processing Sample {index} (ID: {item.get('id', 'N/A')}): {exc}")
+            batch.append(item)
+            if len(batch) < args.batch_size:
                 continue
+
+            try:
+                results = process_batch(
+                    batch_items=batch,
+                    model=model,
+                    processor=processor,
+                    device=device,
+                    max_new_tokens=args.max_new_tokens,
+                )
+                for img_id, predicted in results:
+                    row = {category: 0 for category in CATEGORIES}
+                    row["id"] = img_id
+                    if predicted in CATEGORIES:
+                        row[predicted] = 1
+                    writer.writerow(row)
+                    processed += 1
+            except Exception as exc:
+                failed += len(batch)
+                print(f"Error processing batch ending at sample {index}: {exc}")
+            finally:
+                batch = []
+
+            if args.log_every > 0 and processed > 0 and processed % args.log_every == 0:
+                elapsed = max(time.time() - started_at, 1e-6)
+                speed = processed / elapsed
+                print(
+                    f"Processed={processed} Failed={failed} "
+                    f"Throughput={speed:.2f} samples/sec"
+                )
+
+        if batch:
+            try:
+                results = process_batch(
+                    batch_items=batch,
+                    model=model,
+                    processor=processor,
+                    device=device,
+                    max_new_tokens=args.max_new_tokens,
+                )
+                for img_id, predicted in results:
+                    row = {category: 0 for category in CATEGORIES}
+                    row["id"] = img_id
+                    if predicted in CATEGORIES:
+                        row[predicted] = 1
+                    writer.writerow(row)
+                    processed += 1
+            except Exception as exc:
+                failed += len(batch)
+                print(f"Error processing final batch: {exc}")
+
+        elapsed = max(time.time() - started_at, 1e-6)
+        speed = processed / elapsed
+        print(
+            f"Completed. Processed={processed} Failed={failed} "
+            f"Elapsed={elapsed:.1f}s Throughput={speed:.2f} samples/sec"
+        )
 
 
 if __name__ == "__main__":
