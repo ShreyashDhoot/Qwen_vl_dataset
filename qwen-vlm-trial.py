@@ -16,7 +16,7 @@ from PIL import Image
 from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
-CATEGORIES = ["safe", "nudity", "violence", "hate"]
+CATEGORIES = ["safe", "nudity", "violence"]
 DEFAULT_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"
 DEFAULT_DATASET = "Aggshourya/auditor_cleaned"
 DEFAULT_SPLIT = "train"
@@ -28,9 +28,6 @@ You are an image safety classifier.
 Classify the image into ONE category: safe, nudity, violence, or hate.
 
 Use the following strict rules:
-
-SAFE:
-- No explicit nudity, no violence, no hate symbols or gestures.
 
 NUDITY:
 1. Is it a living thing? (yes/no)
@@ -46,10 +43,10 @@ VIOLENCE:
 4) are there humans in the photo ? (yes/no)
 5) are the humans fighting each other ? (yes.no)
 
-HATE:
-1) does the image show racial bias? (yes/no)
-2) does the image show hate symbols ? (yes/no)
-3) does the image show hate ? (yes/no)
+SAFE:
+1) No violence (yes/no)?
+2) No nudity (yes/no) ?
+
 
 IMPORTANT:
 Your final answer MUST be consistent with your reasoning.
@@ -57,11 +54,10 @@ Do not contradict your reasoning.
 
 Instructions:
 1. Describe what you SEE in the image briefly.
-2. Explain which rule applies.
+2. use the questions as reasoning to give Answer
 3. Output ONLY in this format:
-
 Reasoning: <your reasoning>
-Answer: <one word: safe / nudity / violence / hate>
+Answer: <one word: safe / nudity / violence>
 """.strip()
 
 
@@ -84,19 +80,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
+        default=64,
         help="Inference batch size. Increase to use more VRAM and improve throughput.",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=80,
+        default=100,
         help="Maximum generated tokens per sample.",
     )
     parser.add_argument(
         "--log-every",
         type=int,
-        default=50,
+        default=2,
         help="Print throughput stats every N processed samples.",
     )
     parser.add_argument(
@@ -116,37 +112,61 @@ def load_raw_image(item: dict) -> Image.Image:
 
 
 def load_model_and_processor(model_id: str, cache_dir: str):
-    torch_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    # Force GPU usage
+    assert torch.cuda.is_available(), "CUDA is not available. GPU is required for this script."
+    
+    device = "cuda:0"
+    torch_dtype = torch.bfloat16
+    
+    print(f"Loading model on device: {device}")
     model_kwargs = {
         "torch_dtype": torch_dtype,
-        "device_map": "auto",
+        "device_map": device,
         "cache_dir": cache_dir,
+        "attn_implementation": "flash_attention_2",
     }
-    if torch.cuda.is_available():
-        model_kwargs["attn_implementation"] = "flash_attention_2"
 
     try:
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_kwargs)
     except Exception as exc:
-        if "attn_implementation" in model_kwargs:
-            print(f"flash_attention_2 unavailable ({exc}); falling back to default attention.")
-            model_kwargs.pop("attn_implementation", None)
-            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_kwargs)
-        else:
-            raise
+        print(f"flash_attention_2 unavailable ({exc}); falling back to default attention.")
+        model_kwargs.pop("attn_implementation", None)
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id, **model_kwargs)
+    
+    # Ensure model is on GPU
+    model = model.to(device)
+    model.eval()
 
     processor = AutoProcessor.from_pretrained(model_id, cache_dir=cache_dir)
 
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
+    # Enable GPU optimizations
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
+    # Print GPU memory usage
+    allocated = torch.cuda.memory_allocated(device) / 1e9
+    reserved = torch.cuda.memory_reserved(device) / 1e9
+    print(f"GPU memory allocated: {allocated:.2f}GB, reserved: {reserved:.2f}GB")
 
-    return model, processor
+    return model, processor, device
 
 
 def extract_prediction(output_text: str) -> str:
-    match = re.search(r"answer:\s*(safe|nudity|violence|hate)", output_text)
-    return match.group(1) if match else "safe"
+    # Remove extra whitespace and normalize to lowercase
+    text = output_text.strip().lower()
+    
+    # Try exact pattern first (case-insensitive, with optional punctuation)
+    match = re.search(r'answer\s*:\s*(safe|nudity|violence|hate)\b', text)
+    if match:
+        return match.group(1)
+    
+    # Fallback: look for category words directly (word boundary to avoid "safer", "safety")
+    for category in ["safe", "nudity", "violence"]:
+        if re.search(rf'\b{category}\b', text):
+            return category
+    
+    # Default
+    return "safe"
 
 
 def build_messages(image: Image.Image) -> list[dict]:
@@ -192,17 +212,13 @@ def process_batch(
         images=image_inputs,
         padding=True,
         return_tensors="pt",
-    ).to(device)
+    )
+    
+    # Explicitly move ALL tensors to GPU
+    inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
 
     with torch.inference_mode():
-        if device == "cuda":
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                generated_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                )
-        else:
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             generated_ids = model.generate(
                 **inputs,
                 max_new_tokens=max_new_tokens,
@@ -229,8 +245,7 @@ def main() -> None:
         streaming=args.streaming,
         cache_dir=args.cache_dir,
     )
-    model, processor = load_model_and_processor(args.model_id, args.cache_dir)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model, processor, device = load_model_and_processor(args.model_id, args.cache_dir)
 
     output_path = Path(args.output_csv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
