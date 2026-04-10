@@ -1,0 +1,6 @@
+accelerate
+datasets
+pillow
+qwen-vl-utils
+torch
+transformers
