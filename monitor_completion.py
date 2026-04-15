@@ -15,7 +15,7 @@ import time
 from collections import deque
 from pathlib import Path
 
-DEFAULT_CSV = "Qwen_dataset_clean.csv"
+DEFAULT_CSV = "internvl_predictions.csv"
 DEFAULT_TARGET = 79000
 
 

@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Hugging Face / dataset caches
+hf_cache/
+.cache/
+
+# Generated outputs
+*.parquet
+*.tmp
+*.log
+internvl_predictions.csv
+
+# Local model or temp files
+*.swp
+*.swo

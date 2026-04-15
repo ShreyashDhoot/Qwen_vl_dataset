@@ -1,6 +1,22 @@
-accelerate
-datasets
-pillow
-qwen-vl-utils
-torch
-transformers
+# Reproducible runtime dependencies for internvl.py
+#
+# Why these pins:
+# - transformers is pinned by internvl.py
+# - torch/torchvision are pinned to a matching CUDA 12.8 nightly pair that
+#   worked on Blackwell (sm_120) and avoided the earlier CUDA kernel errors
+# - other direct dependencies are constrained tightly to reduce drift
+
+--index-url https://download.pytorch.org/whl/nightly/cu128
+--extra-index-url https://pypi.org/simple
+
+transformers==4.51.3
+torch==2.12.0.dev20260407+cu128
+torchvision==0.27.0.dev20260407+cu128
+torchaudio==2.12.0.dev20260407+cu128
+
+datasets>=2.19.0,<3.0.0
+Pillow>=10.3.0,<11.0.0
+accelerate>=0.34.0,<1.0.0
+sentencepiece==0.2.0
+safetensors>=0.4.3,<1.0.0
+tokenizers>=0.21.0,<0.22.0

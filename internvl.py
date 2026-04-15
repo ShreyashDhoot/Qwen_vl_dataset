@@ -170,6 +170,66 @@ def patch_torch_linspace() -> None:
     torch.linspace = _safe_linspace  # type: ignore[assignment]
 
 
+def pytorch_wheel_index(torch_cuda_version: str | None) -> str:
+    if not torch_cuda_version:
+        return "https://download.pytorch.org/whl/cpu"
+
+    # Convert versions like "12.8" -> "cu128".
+    cuda_tag = "cu" + torch_cuda_version.replace(".", "")
+    return f"https://download.pytorch.org/whl/{cuda_tag}"
+
+
+def cuda_major_version(value: object) -> str | None:
+    if value is None:
+        return None
+
+    if isinstance(value, int):
+        if value >= 1000:
+            # CUDART_VERSION style integers: 12080 -> 12, 13000 -> 13.
+            return str(value // 1000)
+        if value >= 100:
+            # Some builds may expose compact integers: 130 -> 13.
+            return str(value // 10)
+        return str(value)
+
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return cuda_major_version(int(text))
+
+    return text.split(".", 1)[0]
+
+
+def ensure_torchvision_compat() -> None:
+    torch_cuda = torch.version.cuda
+    expected_index = pytorch_wheel_index(torch_cuda)
+
+    try:
+        import torchvision
+    except Exception as exc:
+        raise RuntimeError(
+            "torchvision is missing or broken, and transformers needs it while resolving model classes.\n"
+            "Install matching torch + torchvision wheels together, for example:\n"
+            "  pip uninstall -y torch torchvision\n"
+            f"  pip install -U torch torchvision --index-url {expected_index}"
+        ) from exc
+
+    torchvision_cuda = getattr(torchvision.version, "cuda", None)
+    torch_major = cuda_major_version(torch_cuda)
+    torchvision_major = cuda_major_version(torchvision_cuda)
+    if torch_major and torchvision_major:
+        if torch_major != torchvision_major:
+            raise RuntimeError(
+                "Detected that torch and torchvision use different CUDA major versions.\n"
+                f"torch CUDA: {torch_cuda}\n"
+                f"torchvision CUDA: {torchvision_cuda}\n"
+                "Reinstall matching builds together, for example:\n"
+                "  pip uninstall -y torch torchvision\n"
+                f"  pip install -U torch torchvision --index-url {expected_index}"
+            )
+
+
 def load_image(item: dict) -> Image.Image:
     image_obj = item["image"]
     if isinstance(image_obj, dict) and "bytes" in image_obj:
@@ -193,13 +253,28 @@ def preprocess_image(image: Image.Image, image_size: int) -> torch.Tensor:
 
 
 def get_model_device(model) -> torch.device:
+    def normalize_device(candidate: torch.device) -> torch.device:
+        if candidate.type != "cuda":
+            return candidate
+        if not torch.cuda.is_available() or torch.cuda.device_count() <= 0:
+            return torch.device("cpu")
+
+        if candidate.index is None:
+            return torch.device("cuda:0")
+
+        if 0 <= candidate.index < torch.cuda.device_count():
+            return candidate
+
+        # Some remote model wrappers report cuda:1 even when only cuda:0 is visible.
+        return torch.device("cuda:0")
+
     model_device = getattr(model, "device", None)
     if isinstance(model_device, torch.device):
-        return model_device
+        return normalize_device(model_device)
     if isinstance(model_device, str):
-        return torch.device(model_device)
+        return normalize_device(torch.device(model_device))
     try:
-        return next(model.parameters()).device
+        return normalize_device(next(model.parameters()).device)
     except StopIteration:
         return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -207,6 +282,8 @@ def get_model_device(model) -> torch.device:
 def load_model_and_tokenizer(model_id: str, cache_dir: str):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this model. Run on a GPU host over SSH.")
+
+    ensure_torchvision_compat()
 
     print(f"Loading model: {model_id}")
     model = AutoModel.from_pretrained(
