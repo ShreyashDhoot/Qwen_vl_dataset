@@ -35,11 +35,36 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Append NSFW-T2I samples to HF dataset as a new parquet shard.")
     parser.add_argument("--source-dataset", default="zxbsmk/NSFW-T2I", help="Source dataset repo.")
     parser.add_argument("--source-split", default="train", help="Source split.")
-    parser.add_argument("--target-dataset", default="ShreyashDhoot/internvl-auditor", help="Target dataset repo.")
+    parser.add_argument(
+        "--target-dataset",
+        default="ShreyashDhoot/internvl-auditor-v2",
+        help="Target dataset repo.",
+    )
     parser.add_argument("--target-split", default="train", help="Target split label for output shard naming.")
+    parser.add_argument(
+        "--protected-target",
+        default="ShreyashDhoot/internvl-auditor",
+        help="Dataset repo id to protect from accidental writes.",
+    )
+    parser.add_argument(
+        "--allow-protected-target",
+        action="store_true",
+        help="Allow writing to --protected-target. Use only if you really intend to modify that dataset.",
+    )
     parser.add_argument("--cache-dir", default="./hf_cache", help="HF cache directory.")
     parser.add_argument("--max-upload", type=int, default=9000, help="Maximum number of NSFW samples to append.")
     parser.add_argument("--chunk-size", type=int, default=500, help="Rows per parquet shard upload.")
+    parser.add_argument(
+        "--skip-existing-index-scan",
+        action="store_true",
+        help="Skip reading existing target rows; assumes --start-index range is free.",
+    )
+    parser.add_argument(
+        "--skip-source-rows",
+        type=int,
+        default=0,
+        help="Skip the first N source rows before scanning for NSFW matches.",
+    )
     parser.add_argument(
         "--progress-every",
         type=int,
@@ -121,6 +146,11 @@ def validate_hf_token(token: str) -> str:
 def parse_json_field(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            return {}
     if isinstance(raw, str):
         text = raw.strip()
         if not text:
@@ -148,20 +178,53 @@ def extract_nsfw_flag(sample: dict[str, Any]) -> str:
     return ""
 
 
+def extract_prompt(sample: dict[str, Any]) -> str:
+    for key in ("text", "txt", "prompt", "caption"):
+        value = sample.get(key)
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+
+    meta = parse_json_field(sample.get("json", sample.get("metadata", None)))
+    if meta:
+        for key in ("caption", "text", "prompt"):
+            value = meta.get(key)
+            if value is not None:
+                text = str(value).strip()
+                if text:
+                    return text
+
+    return ""
+
+
+def pil_to_hf_image_dict(img: PILImage.Image) -> dict[str, Any]:
+    rgb = img.convert("RGB")
+    buf = io.BytesIO()
+    rgb.save(buf, format="PNG")
+    return {"bytes": buf.getvalue(), "path": None}
+
+
 def normalize_image_for_hf(image_obj):
     if isinstance(image_obj, PILImage.Image):
-        return image_obj.convert("RGB")
+        return pil_to_hf_image_dict(image_obj)
 
     if isinstance(image_obj, dict):
         data = image_obj.get("bytes")
         if data:
-            return PILImage.open(io.BytesIO(data)).convert("RGB")
+            with PILImage.open(io.BytesIO(data)) as img:
+                return pil_to_hf_image_dict(img)
         path = image_obj.get("path")
         if path:
-            return PILImage.open(path).convert("RGB")
+            with PILImage.open(path) as img:
+                return pil_to_hf_image_dict(img)
+
+    if isinstance(image_obj, str) and image_obj:
+        with PILImage.open(image_obj) as img:
+            return pil_to_hf_image_dict(img)
 
     if hasattr(image_obj, "convert"):
-        return image_obj.convert("RGB")
+        return pil_to_hf_image_dict(image_obj)
 
     raise ValueError(f"Unsupported image format for upload: {type(image_obj)!r}")
 
@@ -181,30 +244,51 @@ def output_features() -> Features:
     )
 
 
-def collect_existing_indices(target_dataset: str, target_split: str, cache_dir: str) -> set[int]:
+def collect_existing_indices(target_dataset: str, target_split: str, cache_dir: str, progress_every: int) -> set[int]:
     existing: set[int] = set()
     try:
         ds = load_dataset(target_dataset, split=target_split, streaming=True, cache_dir=cache_dir)
+        if hasattr(ds, "select_columns"):
+            ds = ds.select_columns(["index"])
     except Exception:
         return existing
 
-    for row in ds:
-        raw = row.get("index", None)
-        if raw is None:
-            continue
-        try:
-            existing.add(int(raw))
-        except (TypeError, ValueError):
-            continue
+    bad_rows = 0
+    scanned = 0
+    try:
+        for row in ds:
+            scanned += 1
+            if progress_every > 0 and scanned % progress_every == 0:
+                print(f"Scanned existing rows: {scanned:,}, unique indices collected: {len(existing):,}")
+            try:
+                raw = row.get("index", None)
+                if raw is None:
+                    continue
+                existing.add(int(raw))
+            except (TypeError, ValueError, KeyError):
+                bad_rows += 1
+                continue
+    except (TypeError, RuntimeError) as e:
+        # Schema casting error or other read error. Skip remaining rows.
+        if bad_rows > 0:
+            print(f"Warning: Skipped {bad_rows} rows with schema errors while reading existing indices.")
+        return existing
+
+    if bad_rows > 0:
+        print(f"Warning: Skipped {bad_rows} rows with schema errors while reading existing indices.")
+
+    if scanned > 0:
+        print(f"Finished existing index scan: scanned={scanned:,}, unique={len(existing):,}")
 
     return existing
 
 
 def build_row(sample: dict[str, Any], index_value: int, label_value: str) -> dict[str, Any]:
+    prompt = extract_prompt(sample)
     return {
         "index": index_value,
         "image": normalize_image_for_hf(sample["jpg"]),
-        "prompt": str(sample.get("text", "")),
+        "prompt": prompt,
         "safe": 1 if label_value == "safe" else 0,
         "nudity": 1 if label_value == "nudity" else 0,
         "violence": 1 if label_value == "violence" else 0,
@@ -266,18 +350,41 @@ def main() -> None:
     auth_user = validate_hf_token(hf_token)
     print(f"Authenticated to Hugging Face as: {auth_user}")
 
+    if (
+        not args.dry_run
+        and args.protected_target
+        and args.target_dataset.strip() == args.protected_target.strip()
+        and not args.allow_protected_target
+    ):
+        raise RuntimeError(
+            "Refusing to modify protected dataset. "
+            "Choose a different --target-dataset (recommended: internvl-auditor-v2) "
+            "or pass --allow-protected-target to override intentionally."
+        )
+
     if args.max_upload <= 0:
         raise ValueError("--max-upload must be > 0")
     if args.chunk_size <= 0:
         raise ValueError("--chunk-size must be > 0")
+    if args.skip_source_rows < 0:
+        raise ValueError("--skip-source-rows must be >= 0")
     if args.label_value not in {"safe", "nudity", "violence", "UNK"}:
         raise ValueError("--label-value must be one of: safe, nudity, violence, UNK")
     if args.progress_every < 0:
         raise ValueError("--progress-every must be >= 0")
 
-    print(f"Reading existing target split to preserve append behavior: {args.target_dataset} [{args.target_split}]")
-    existing_indices = collect_existing_indices(args.target_dataset, args.target_split, args.cache_dir)
-    print(f"Existing indices found: {len(existing_indices)}")
+    if args.skip_existing_index_scan:
+        print("Skipping existing index scan; assuming --start-index range is free.")
+        existing_indices: set[int] = set()
+    else:
+        print(f"Reading existing target split to preserve append behavior: {args.target_dataset} [{args.target_split}]")
+        existing_indices = collect_existing_indices(
+            args.target_dataset,
+            args.target_split,
+            args.cache_dir,
+            args.progress_every,
+        )
+        print(f"Existing indices found: {len(existing_indices)}")
 
     source = load_dataset(
         args.source_dataset,
@@ -285,6 +392,23 @@ def main() -> None:
         streaming=True,
         cache_dir=args.cache_dir,
     )
+
+    # Keep raw image payload (no decode) while scanning NSFW flags to reduce overhead and instability.
+    if hasattr(source, "cast_column"):
+        try:
+            source = source.cast_column("jpg", HFImage(decode=False))
+        except Exception as exc:
+            print(f"Warning: could not disable decode for 'jpg' column: {exc}")
+
+    # Read only columns needed for NSFW filtering and row construction.
+    if hasattr(source, "column_names") and hasattr(source, "select_columns"):
+        keep_columns = [
+            name
+            for name in ("jpg", "text", "txt", "caption", "prompt", "NSFW", "nsfw", "json", "metadata")
+            if name in set(source.column_names)
+        ]
+        if keep_columns:
+            source = source.select_columns(keep_columns)
 
     scanned = 0
     appended = 0
@@ -296,9 +420,14 @@ def main() -> None:
         f"Scanning source dataset for NSFW rows... target={args.max_upload:,}, "
         f"chunk-size={args.chunk_size:,}, start-index={args.start_index:,}"
     )
+    if args.skip_source_rows:
+        print(f"Skipping first {args.skip_source_rows:,} source rows before matching.")
 
     for sample in source:
         scanned += 1
+        if scanned <= args.skip_source_rows:
+            continue
+
         if args.progress_every and scanned % args.progress_every == 0:
             print(f"Scanned {scanned:,} source rows, matched {appended:,}/{args.max_upload:,}")
 
@@ -309,7 +438,11 @@ def main() -> None:
         if nsfw_flag != "NSFW":
             continue
 
-        if "jpg" not in sample or "text" not in sample:
+        if "jpg" not in sample:
+            continue
+
+        prompt_value = extract_prompt(sample)
+        if not prompt_value:
             continue
 
         while next_index in existing_indices:
