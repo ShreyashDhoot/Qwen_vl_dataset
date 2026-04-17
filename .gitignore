@@ -22,7 +22,6 @@ hf_cache/
 *.parquet
 *.tmp
 *.log
-internvl_predictions.csv
 
 # Local model or temp files
 *.swp
